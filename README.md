@@ -57,6 +57,7 @@ USER_PASSWORD=""    # The password for your  https://ais.usvisa-info.com/en-ca/n
 EARLIEST_ACCEPTABLE_DATE="" # The earliest interview date you are looking for
 LATEST_ACCEPTABLE_DATE=""   # The latest acceptable interview date
 USER_CONSULATE="" # Use one of the cosulate names from above
+NUM_PARTICIPANTS="1"  # Number of applicants on the appointment (default 1). All are kept selected on reschedule.
 GMAIL_SENDER_NAME=""    # Name of sender on email
 GMAIL_EMAIL=""  # Sender email account
 GMAIL_APPLICATION_PWD=""    # Use the app password you generated for application -- check https://support.google.com/mail/answer/185833?hl=en
@@ -66,6 +67,11 @@ EXCLUSION_START_DATE_1=""   # Start date for first excluded date range
 EXCLUSION_END_DATE_1=""     # End date for first excluded date range
 EXCLUSION_START_DATE_2=""   # Start date for second excluded date range
 EXCLUSION_END_DATE_2=""     # End date for second excluded date range
+DATE_REQUEST_DELAY="180"    # Seconds to wait between availability checks (default 180)
+DATE_REQUEST_JITTER="30"    # Extra random 0-N seconds added to each wait so polling looks less bot-like (default 30)
+FAIL_RETRY_DELAY="180"    # Seconds to wait between failed appointment-page setup retries (default 180)
+SOFT_BAN_COOLDOWN="3600"    # Seconds to cool down when an empty date list signals a soft-ban (default 3600 = 1 hour)
+TEST_MODE="True"    # "True" = dry run (never clicks confirm), "False" = live booking
 ```
 
 You can add upto 9 exclusion date ranges. Each date range to be excluded using the syntax `EXCLUSION_START_DATE_{i}` and `EXCLUSION_END_DATE_{i}` where `i` can be replaced by numbers between 1 to 9.
@@ -73,7 +79,7 @@ You can add upto 9 exclusion date ranges. Each date range to be excluded using t
 ### Find a slot and book it automatically
 
 ```sh
-python reschedule.py
+python3 reschedule.py
 ```
 
 See the script in action. Once you're satisfied with its functionality, set `TEST_MODE` to `False` in `settings.py`. For a headless operation, you can also set `SHOW_GUI` to `False` and allow the script to run unattended.

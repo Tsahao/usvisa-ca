@@ -7,7 +7,10 @@ load_dotenv()
 # Account Info
 USER_EMAIL = os.getenv("USER_EMAIL")
 USER_PASSWORD = os.getenv("USER_PASSWORD")
-NUM_PARTICIPANTS = 1
+try:
+    NUM_PARTICIPANTS = int(os.getenv("NUM_PARTICIPANTS", "1"))
+except (TypeError, ValueError):
+    NUM_PARTICIPANTS = 1
 
 # Say you want an appointment no later than Mar 14, 2024
 # Please strictly follow the YYYY-MM-DD format for all dates
@@ -48,8 +51,31 @@ CONSULATES = {
     "Toronto": 94,
     "Vancouver": 95
 } # Only Toronto and Vancouver consulates are verified
-# Choose a city from the list above
-USER_CONSULATE = os.getenv("USER_CONSULATE")
+
+
+def resolve_consulate(value):
+    """Validate a configured consulate and return its canonical name and ID."""
+    name = (value or "").strip()
+    if not name:
+        raise ValueError(
+            "USER_CONSULATE is missing. Set it in .env to one of: "
+            + ", ".join(CONSULATES)
+        )
+
+    canonical_names = {city.casefold(): city for city in CONSULATES}
+    canonical_name = canonical_names.get(name.casefold())
+    if canonical_name is None:
+        raise ValueError(
+            f"Unsupported USER_CONSULATE={name!r}. Choose one of: "
+            + ", ".join(CONSULATES)
+        )
+    return canonical_name, CONSULATES[canonical_name]
+
+
+# Use one validated facility for both API requests and the browser form.
+USER_CONSULATE, USER_CONSULATE_ID = resolve_consulate(
+    os.getenv("USER_CONSULATE")
+)
 
 # The following is only required for the Gmail notification feature
 # Gmail login info
@@ -65,25 +91,44 @@ RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 # from local import *
 
 # See the automation in action
-SHOW_GUI = False  # toggle to false if you don't want to see the browser
+SHOW_GUI = True  # toggle to false if you don't want to see the browser
 
 # If you just want to see the program run WITHOUT clicking the confirm reschedule button
 # For testing, also set a date really far away so the app actually tries to reschedule
-TEST_MODE = False
+TEST_MODE = os.getenv("TEST_MODE", "True").strip().lower() in ("1", "true", "yes", "on")
 
 # Don't change the following unless you know what you are doing
 DETACH = True
 NEW_SESSION_AFTER_FAILURES = 5
 NEW_SESSION_DELAY = 300
 TIMEOUT = 10
-FAIL_RETRY_DELAY = 180
-DATE_REQUEST_DELAY = 180
+try:
+    FAIL_RETRY_DELAY = int(os.getenv("FAIL_RETRY_DELAY", "180"))
+except (TypeError, ValueError):
+    FAIL_RETRY_DELAY = 180
+try:
+    DATE_REQUEST_DELAY = int(os.getenv("DATE_REQUEST_DELAY", "180"))
+except (TypeError, ValueError):
+    DATE_REQUEST_DELAY = 180
+try:
+    DATE_REQUEST_JITTER = int(os.getenv("DATE_REQUEST_JITTER", "30"))
+except (TypeError, ValueError):
+    DATE_REQUEST_JITTER = 30
 DATE_REQUEST_MAX_RETRY = 5
 DATE_REQUEST_MAX_TIME = 15 * 60
+try:
+    SOFT_BAN_COOLDOWN = int(os.getenv("SOFT_BAN_COOLDOWN", "3600"))
+except (TypeError, ValueError):
+    SOFT_BAN_COOLDOWN = 60 * 60
 LOGIN_URL = "https://ais.usvisa-info.com/en-ca/niv/users/sign_in"
-AVAILABLE_DATE_REQUEST_SUFFIX = f"/days/{CONSULATES[USER_CONSULATE]}.json?appointments[expedite]=false"
+AVAILABLE_DATE_REQUEST_SUFFIX = f"/days/{USER_CONSULATE_ID}.json?appointments[expedite]=false"
 APPOINTMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/appointment"
 PAYMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/payment"
 REQUEST_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
