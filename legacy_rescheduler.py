@@ -1,5 +1,6 @@
 from time import sleep
 from datetime import datetime, date
+from typing import Sequence, Tuple, Optional
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -391,7 +392,204 @@ def _ensure_all_applicants_selected_and_continue(driver, timeout=10):
     return True
 
 
-def legacy_reschedule(driver: WebDriver, date_to_book: date):
+_MONTH_NAME_TO_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def _read_datepicker_header(driver) -> Optional[Tuple[int, int]]:
+    """Read the visible datepicker month as (year, month). None if unparseable."""
+    import re as _re
+
+    container_candidates = [
+        (By.ID, "ui-datepicker-div"),
+        (By.XPATH, "//div[@id='ui-datepicker-div']"),
+    ]
+    container = None
+    for by, value in container_candidates:
+        try:
+            found = driver.find_elements(by, value)
+        except Exception:
+            continue
+        if found:
+            container = found[0]
+            break
+    if container is None:
+        return None
+    # Preferred: jQuery-UI month/year spans.
+    try:
+        month_els = container.find_elements(By.CLASS_NAME, "ui-datepicker-month")
+        year_els = container.find_elements(By.CLASS_NAME, "ui-datepicker-year")
+        if month_els and year_els:
+            month_num = _MONTH_NAME_TO_NUM.get(month_els[0].text.strip().lower())
+            year_num = int(year_els[0].text.strip())
+            if month_num:
+                return (year_num, month_num)
+    except Exception:
+        pass
+    # Fallback: title text like "January 2027".
+    try:
+        title_els = container.find_elements(By.CLASS_NAME, "ui-datepicker-title")
+        texts = [el.text for el in title_els] or [container.text]
+        for text in texts:
+            m = _re.search(r"([A-Za-z]+)\s+(\d{4})", text or "")
+            if m:
+                month_num = _MONTH_NAME_TO_NUM.get(m.group(1).lower())
+                if month_num:
+                    return (int(m.group(2)), month_num)
+    except Exception:
+        pass
+    return None
+
+
+def _click_datepicker_next(driver) -> bool:
+    locators = [
+        (By.CSS_SELECTOR, "a.ui-datepicker-next"),
+        (By.XPATH, "//div[@id='ui-datepicker-div']//a[contains(@class,'ui-datepicker-next')]"),
+        # Legacy positional selector, kept last.
+        (By.XPATH, "//div[@id='ui-datepicker-div']/div[2]/div/a"),
+    ]
+    for by, value in locators:
+        try:
+            for el in driver.find_elements(by, value):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        el.click()
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def _navigate_to_target_month(driver, target: date, max_clicks: int = 24) -> Optional[bool]:
+    """Advance the datepicker to target's month. True=there, False=overshot/cap, None=header unreadable.
+
+    ZERO-SLEEP experiment: no fixed sleeps. Each step logs header
+    before->after, wait_ms for the header to change, and day-cell count
+    so a log review can judge reliability.
+    """
+    import time as _time
+
+    step_wait_timeout = 5
+    for step in range(max_clicks + 1):
+        step_start = _time.time()
+        header_before = _read_datepicker_header(driver)
+        if header_before is None:
+            print(f"[NAV] step {step}: header unreadable before click (target {target})")
+            return None
+        if header_before == (target.year, target.month):
+            try:
+                cells = driver.find_elements(By.XPATH, "//div[@id='ui-datepicker-div']/div[1]/table//td")
+                cell_count = len(cells)
+            except Exception:
+                cell_count = -1
+            print(f"[NAV] step {step}: already at {header_before[0]}-{header_before[1]:02d} "
+                  f"(target {target}), wait_ms={int((_time.time() - step_start) * 1000)}, cells={cell_count}")
+            return True
+        if header_before > (target.year, target.month):
+            print(f"[NAV] step {step}: overshoot {header_before[0]}-{header_before[1]:02d} "
+                  f"past target {target}, wait_ms={int((_time.time() - step_start) * 1000)}")
+            return False
+        if not _click_datepicker_next(driver):
+            print(f"[NAV] step {step}: next-arrow not clickable "
+                  f"(from {header_before[0]}-{header_before[1]:02d} toward {target}), "
+                  f"wait_ms={int((_time.time() - step_start) * 1000)}")
+            return False
+        # Event-driven: wait until the header text actually changes.
+        wait_start = _time.time()
+        try:
+            WebDriverWait(driver, step_wait_timeout).until(
+                lambda d: _read_datepicker_header(d) not in (None, header_before)
+            )
+            event_fired = True
+        except Exception:
+            event_fired = False
+        header_after = _read_datepicker_header(driver)
+        try:
+            cells = driver.find_elements(By.XPATH, "//div[@id='ui-datepicker-div']/div[1]/table//td")
+            cell_count = len(cells)
+        except Exception:
+            cell_count = -1
+        wait_ms = int((_time.time() - wait_start) * 1000)
+        total_ms = int((_time.time() - step_start) * 1000)
+        after_txt = f"{header_after[0]}-{header_after[1]:02d}" if header_after else "unreadable"
+        print(f"[NAV] step {step}: {header_before[0]}-{header_before[1]:02d}->{after_txt} "
+              f"toward {target}, event_fired={event_fired}, wait_ms={wait_ms}, total_ms={total_ms}, cells={cell_count}")
+        if header_after is None:
+            return None
+    print(f"[NAV] cap reached ({max_clicks} clicks) without reaching {target}")
+    return False
+
+
+def _click_exact_day(driver, target: date) -> bool:
+    """Click target.day in the visible month if it is available. No fallback to other days."""
+    import time as _time
+    start = _time.time()
+    try:
+        month = driver.find_element(By.XPATH, "//div[@id='ui-datepicker-div']/div[1]/table/tbody")
+    except Exception as e:
+        print(f"[PICK] day {target.day}: month table not found ({e}), ms={int((_time.time() - start) * 1000)}")
+        return False
+    try:
+        cells = month.find_elements(By.TAG_NAME, "td")
+    except Exception as e:
+        print(f"[PICK] day {target.day}: could not read cells ({e}), ms={int((_time.time() - start) * 1000)}")
+        return False
+    for cell in cells:
+        try:
+            links = cell.find_elements(By.TAG_NAME, "a")
+        except Exception:
+            continue
+        if not links:
+            continue
+        try:
+            if links[0].text.strip() != str(target.day):
+                continue
+            cls = cell.get_attribute("class") or ""
+        except Exception:
+            continue
+        if "unselectable" in cls or "ui-datepicker-other-month" in cls:
+            print(f"[PICK] day {target.day}: shown but disabled (slot gone), class={cls!r}, ms={int((_time.time() - start) * 1000)}")
+            return False  # day shown but disabled = slot gone
+        if "undefined" not in cls:
+            # Keep the site's original availability signal; unknown markup = do not click.
+            continue
+        try:
+            links[0].click()
+            print(f"[PICK] day {target.day}: clicked, class={cls!r}, ms={int((_time.time() - start) * 1000)}")
+            return True
+        except Exception as e:
+            print(f"[PICK] day {target.day}: click failed ({e}), ms={int((_time.time() - start) * 1000)}")
+            return False
+    print(f"[PICK] day {target.day}: not found among {len(cells)} cells, ms={int((_time.time() - start) * 1000)}")
+    return False
+
+
+def _date_in_exclusions(candidate: date, exclusions: Sequence[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    for start, end in exclusions or ():
+        try:
+            s = datetime.strptime(start, "%Y-%m-%d").date()
+            e = datetime.strptime(end, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if s <= candidate <= e:
+            return (start, end)
+    return None
+
+
+def legacy_reschedule(
+    driver: WebDriver,
+    date_to_book: date,
+    earliest: Optional[date] = None,
+    latest: Optional[date] = None,
+    exclusions: Sequence[Tuple[str, str]] = (),
+    current_date: Optional[date] = None,
+    only_earlier: bool = True,
+):
     driver.refresh()
 
     # Wait for the post-refresh page to load: either the date picker
@@ -435,42 +633,35 @@ def legacy_reschedule(driver: WebDriver, date_to_book: date):
     sleep(2)
     date_selection_box.click()
 
-    # Move to next month
-    def next_month():
-        driver.find_element(By.XPATH, "//div[@id='ui-datepicker-div']/div[2]/div/a").click()
-
-    # Check if avalible in current month
-    def cur_month_ava():
+    # Target-aware picking: navigate to date_to_book's month and click
+    # that exact day. Never fall back to "nearest available" -- that is
+    # what booked out-of-window dates (e.g. API said 01-21, calendar
+    # clicked 01-08).
+    print("Trying to pick time and reschedule...")
+    nav_result = _navigate_to_target_month(driver, date_to_book)
+    if nav_result is True:
+        if not _click_exact_day(driver, date_to_book):
+            print(f"{datetime.now().strftime('%H:%M:%S')} SLOT '{date_to_book}' not clickable in calendar (slot gone / API-UI mismatch)\n")
+            return False
+    elif nav_result is None:
+        # Header unreadable (site markup changed?) -- legacy fallback to
+        # nearest available, still protected by the guard below. Log loudly
+        # so we notice and fix the header parser.
+        print("WARNING: datepicker month header unreadable, falling back to nearest-available (guard still applies)")
         month = driver.find_element(By.XPATH, "//div[@id='ui-datepicker-div']/div[1]/table/tbody")
         dates = month.find_elements(By.TAG_NAME, "td")
-        for date in dates:
-            if date.get_attribute("class") == " undefined":
-                ava_date_btn = date.find_element(By.TAG_NAME, "a")
-                return True
+        ava_date_btn = None
+        for cell in dates:
+            if cell.get_attribute("class") == " undefined":
+                ava_date_btn = cell.find_element(By.TAG_NAME, "a")
+                break
+        if ava_date_btn is None:
+            print(f"{datetime.now().strftime('%H:%M:%S')} No clickable day in calendar\n")
+            return False
+        ava_date_btn.click()
+    else:
+        print(f"{datetime.now().strftime('%H:%M:%S')} Could not navigate calendar to {date_to_book} (overshot/cap)\n")
         return False
-
-    # Check the nearest slot is avalible in # months (0 for this month, 1 for next month...) and move to the month
-    def nearest_ava():
-        ava_in = 0
-        cur = cur_month_ava()
-        while not cur:
-            next_month()
-            cur = cur_month_ava()
-            ava_in += 1
-        return ava_in
-
-    avalible_in_months = nearest_ava()
-
-    # Reschedule if the avalible_in_months is less than or equal to wait month
-    print("Trying to pick time and reschedule...")
-    month = driver.find_element(By.XPATH, "//div[@id='ui-datepicker-div']/div[1]/table/tbody")
-    dates = month.find_elements(By.TAG_NAME, "td")
-    ava_date_btn = None
-    for date in dates:
-        if date.get_attribute("class") == " undefined":
-            ava_date_btn = date.find_element(By.TAG_NAME, "a")
-            break
-    ava_date_btn.click()
 
     # confirm selected date
     sleep(2)
@@ -483,11 +674,27 @@ def legacy_reschedule(driver: WebDriver, date_to_book: date):
     )
     date_selected = datetime.strptime(date_box.get_attribute('value'), "%Y-%m-%d").date()
     print(date_selected)
-    if not date_selected <= date_to_book:
-        print(f"{datetime.now().strftime('%H:%M:%S')} SLOT '{date_to_book}' no longer available\n")
+    # Guard: never book outside the caller's criteria, no matter what the
+    # calendar was clicked on.
+    if earliest is not None and date_selected < earliest:
+        print(f"{datetime.now().strftime('%H:%M:%S')} BLOCKED: calendar picked {date_selected}, earlier than earliest {earliest} (wanted {date_to_book})\n")
         return False
+    if latest is not None and date_selected > latest:
+        print(f"{datetime.now().strftime('%H:%M:%S')} BLOCKED: calendar picked {date_selected}, later than latest {latest} (wanted {date_to_book})\n")
+        return False
+    excluded_range = _date_in_exclusions(date_selected, exclusions)
+    if excluded_range is not None:
+        print(f"{datetime.now().strftime('%H:%M:%S')} BLOCKED: calendar picked {date_selected}, in excluded range {excluded_range[0]} to {excluded_range[1]} (wanted {date_to_book})\n")
+        return False
+    if only_earlier and current_date is not None and date_selected >= current_date:
+        print(f"{datetime.now().strftime('%H:%M:%S')} BLOCKED: calendar picked {date_selected}, not earlier than currently booked {current_date} (wanted {date_to_book})\n")
+        return False
+    if date_selected != date_to_book:
+        print(f"{datetime.now().strftime('%H:%M:%S')} NOTE: calendar picked {date_selected}, wanted {date_to_book} -- in-window so proceeding\n")
     else:
         print(f"{datetime.now().strftime('%H:%M:%S')} SLOT '{date_selected}' is still available. Booking....\n")
+    if current_date is not None and date_selected >= current_date and not only_earlier:
+        print(f"{datetime.now().strftime('%H:%M:%S')} WARNING: {date_selected} is not earlier than {current_date}, proceeding because only_earlier=False\n")
 
     # Select time of the date:
     sleep(2)

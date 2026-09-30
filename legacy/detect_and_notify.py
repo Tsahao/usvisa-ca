@@ -82,7 +82,7 @@ def detect_and_notify(loc_str_array: list, date_str_array: list) -> bool:
 
 
 def detect_with_new_session() -> bool:
-    driver = get_chrome_driver()
+    driver, user_data_dir = get_chrome_driver()
     session_failures = 0
     detected = False
     while session_failures < NEW_SESSION_AFTER_FAILURES:
@@ -96,7 +96,11 @@ def detect_with_new_session() -> bool:
             session_failures += 1
             sleep(FAIL_RETRY_DELAY)
             continue
-    driver.quit()
+    try:
+        driver.quit()
+    finally:
+        import shutil
+        shutil.rmtree(user_data_dir, ignore_errors=True)
     return detected
 
 

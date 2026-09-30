@@ -73,6 +73,7 @@ DATE_REQUEST_JITTER="30"    # Extra random 0-N seconds added to each wait so pol
 FAIL_RETRY_DELAY="180"    # Seconds to wait between failed appointment-page setup retries (default 180)
 SOFT_BAN_COOLDOWN="3600"    # Seconds to cool down when an empty date list signals a soft-ban (default 3600 = 1 hour)
 TEST_MODE="True"    # "True" = dry run (never clicks confirm), "False" = live booking
+ONLY_EARLIER_THAN_CURRENT_APPOINTMENT="True"    # In .env (project root): "True" (default) = only book strictly earlier than your current appointment; "False" = allow any in-window date (e.g. later date at a different consulate)
 ```
 
 You can add upto 9 exclusion date ranges. Each date range to be excluded using the syntax `EXCLUSION_START_DATE_{i}` and `EXCLUSION_END_DATE_{i}` where `i` can be replaced by numbers between 1 to 9.

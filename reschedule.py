@@ -1,5 +1,6 @@
 import random
 import re
+import shutil
 import time
 import traceback
 from datetime import datetime
@@ -45,7 +46,7 @@ class SoftBanDetected(Exception):
 SETUP_FAILURE_SOFT_BAN_THRESHOLD = 15
 _consecutive_setup_failures = 0
 
-def get_chrome_driver() -> WebDriver:
+def get_chrome_driver() -> tuple:
     options = webdriver.ChromeOptions()
     if not SHOW_GUI:
         options.add_argument("headless")
@@ -56,9 +57,10 @@ def get_chrome_driver() -> WebDriver:
     options.add_argument('--incognito')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
-    options.add_argument(f'--user-data-dir=/tmp/chrome-{datetime.now().strftime("%Y%m%d-%H%M%S")}')
+    user_data_dir = f'/tmp/chrome-{datetime.now().strftime("%Y%m%d-%H%M%S")}-{random.randint(1000, 9999)}'
+    options.add_argument(f'--user-data-dir={user_data_dir}')
     driver = webdriver.Chrome(options=options)
-    return driver
+    return driver, user_data_dir
 
 
 def login(driver: WebDriver) -> None:
@@ -84,6 +86,65 @@ def login(driver: WebDriver) -> None:
         EC.element_to_be_clickable((By.NAME, "commit"))
     )
     login_button.click()
+
+
+def parse_consular_appointment_date(text: str):
+    """Parse the booked date out of a consular-appt block's text.
+
+    Handles "14 January, 2027" (site format from p.consular-appt) plus
+    "January 14, 2027" and ISO "2027-01-14" variants. Returns a date or
+    None when no recognizable date is present. Pure function (no driver)
+    so it is unit-testable.
+    """
+    if not text:
+        return None
+    match = re.search(r"(\d{1,2})\s+([A-Za-z]+),\s+(\d{4})", text)
+    if match:
+        try:
+            return datetime.strptime(
+                f"{match.group(1)} {match.group(2)} {match.group(3)}",
+                "%d %B %Y",
+            ).date()
+        except ValueError:
+            pass
+    match = re.search(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})", text)
+    if match:
+        try:
+            return datetime.strptime(
+                f"{match.group(1)} {match.group(2)} {match.group(3)}",
+                "%B %d %Y",
+            ).date()
+        except ValueError:
+            pass
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        try:
+            return datetime.strptime(match.group(0), "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return None
+
+
+def get_current_appointment_date(driver: WebDriver):
+    """Read the currently booked date from the dashboard.
+
+    Looks for <p class="consular-appt">Consular Appointment: 14 January,
+    2027, ...</p>. Returns None when the block is absent (paid but never
+    booked) or unparseable. Must be called while on the post-login
+    dashboard, before navigating to the appointment page.
+    """
+    try:
+        elements = driver.find_elements(By.CSS_SELECTOR, "p.consular-appt")
+    except Exception:
+        return None
+    for element in elements:
+        try:
+            parsed = parse_consular_appointment_date(element.text)
+        except Exception:
+            continue
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _find_visible_action(driver: WebDriver, label: str):
@@ -273,7 +334,7 @@ def get_available_dates(
     return dates
 
 
-def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
+def reschedule(driver: WebDriver, retryCount: int = 0, current_date=None) -> bool:
     date_request_tracker = RequestTracker(
         retryCount if (retryCount > 0) else DATE_REQUEST_MAX_RETRY,
         DATE_REQUEST_DELAY * retryCount if (retryCount > 0) else DATE_REQUEST_MAX_TIME
@@ -325,9 +386,40 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
             # errors (network/empty/booking) are what trigger a restart.
             date_request_tracker.forgive_last_retry(time.time() - iteration_start)
             continue
+        if (
+            ONLY_EARLIER_THAN_CURRENT_APPOINTMENT
+            and current_date is not None
+            and target_date >= current_date
+        ):
+            log_message(
+                f"Skipping {target_date}: not earlier than currently booked "
+                f"{current_date} (ONLY_EARLIER_THAN_CURRENT_APPOINTMENT=True; set it to False "
+                f"in .env to allow later dates, e.g. different consulate). "
+                f"Earliest available on calendar is {min(dates)}."
+            )
+            sleep(jittered_delay(DATE_REQUEST_DELAY))
+            # Same as out-of-window: healthy poll, keep the session alive.
+            date_request_tracker.forgive_last_retry(time.time() - iteration_start)
+            continue
+        if (
+            current_date is not None
+            and target_date >= current_date
+        ):
+            log_message(
+                f"WARNING: {target_date} is not earlier than currently booked "
+                f"{current_date}, but ONLY_EARLIER_THAN_CURRENT_APPOINTMENT=False so proceeding."
+            )
         log_message(f"FOUND SLOT ON {target_date}!!!")
         try:
-            if legacy_reschedule(driver, target_date):
+            if legacy_reschedule(
+                driver,
+                target_date,
+                earliest_acceptable_date,
+                latest_acceptable_date,
+                EXCLUSION_DATE_RANGES,
+                current_date,
+                ONLY_EARLIER_THAN_CURRENT_APPOINTMENT,
+            ):
                 gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
                 msg = Message(
                     f"Visa Appointment Rescheduled for {target_date}",
@@ -364,14 +456,38 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
 
 def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> bool:
     global _consecutive_setup_failures
-    driver = get_chrome_driver()
+    driver, user_data_dir = get_chrome_driver()
     try:
         session_failures = 0
         timeout = TIMEOUT
         setup_ok = False
+        current_date = None
         while session_failures < NEW_SESSION_AFTER_FAILURES:
             try:
                 login(driver)
+                # Dashboard settles here: capture the booked date BEFORE
+                # navigating to the appointment page (the p.consular-appt
+                # node is only on the dashboard). Absent => first-book flow.
+                try:
+                    WebDriverWait(driver, timeout).until(
+                        lambda d: d.find_elements(By.CSS_SELECTOR, "p.consular-appt")
+                        or _find_visible_action(d, "Schedule Appointment")
+                        or _find_visible_action(d, "Continue")
+                    )
+                except TimeoutException:
+                    pass
+                current_date = get_current_appointment_date(driver)
+                if current_date is not None:
+                    log_message(
+                        f"Currently booked appointment: {current_date} "
+                        f"(ONLY_EARLIER_THAN_CURRENT_APPOINTMENT={ONLY_EARLIER_THAN_CURRENT_APPOINTMENT})"
+                    )
+                else:
+                    log_message(
+                        "No currently booked appointment detected (first-book flow). "
+                        f"ONLY_EARLIER_THAN_CURRENT_APPOINTMENT={ONLY_EARLIER_THAN_CURRENT_APPOINTMENT} "
+                        "(guard inactive without a current date)."
+                    )
                 get_appointment_page(driver)
                 _prepare_appointment_page(driver)
                 setup_ok = True
@@ -397,7 +513,7 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
                 continue
         if setup_ok:
             _consecutive_setup_failures = 0
-        rescheduled = reschedule(driver, retryCount)
+        rescheduled = reschedule(driver, retryCount, current_date)
         if rescheduled:
             return True
         else:
@@ -412,14 +528,20 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
             driver.quit()
         except Exception:
             pass
+        shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
     session_count = 0
     log_message(f"Attempting to reschedule for email: {USER_EMAIL}")
+    if TEST_MODE:
+        log_message("TEST MODE ENABLED - final confirmation click will be SKIPPED (no booking will be made)")
+    else:
+        log_message("LIVE MODE - final confirmation click WILL book the appointment!")
     log_message(f"User Consulate: {USER_CONSULATE}")
     log_message(f"Earliest Acceptable Date: {EARLIEST_ACCEPTABLE_DATE}")
     log_message(f"Latest Acceptable Date: {LATEST_ACCEPTABLE_DATE}")
+    log_message(f"Only Earlier Than Current Appointment: {ONLY_EARLIER_THAN_CURRENT_APPOINTMENT}")
 
     if EXCLUSION_DATE_RANGES:
         log_message("Excluded Date Ranges:")
@@ -428,21 +550,35 @@ if __name__ == "__main__":
     else:
         log_message("No date ranges excluded")
 
-    while True:
-        session_count += 1
-        log_message(f"Attempting with new session #{session_count}")
-        try:
-            rescheduled = reschedule_with_new_session()
-        except WebDriverException as e:
-            log_message(f"Browser died outside poll loop ({e}) - starting a new session")
-            rescheduled = False
-        except Exception as e:
-            log_message(f"Unexpected error in session #{session_count}: {e}")
-            traceback.print_exc()
-            rescheduled = False
-        sleep(NEW_SESSION_DELAY)
-        if rescheduled:
-            break
+    stopped_by_user = False
+    try:
+        while True:
+            session_count += 1
+            log_message(f"Attempting with new session #{session_count}")
+            try:
+                rescheduled = reschedule_with_new_session()
+            except KeyboardInterrupt:
+                stopped_by_user = True
+                break
+            except WebDriverException as e:
+                log_message(f"Browser died outside poll loop ({e}) - starting a new session")
+                rescheduled = False
+            except Exception as e:
+                log_message(f"Unexpected error in session #{session_count}: {e}")
+                traceback.print_exc()
+                rescheduled = False
+            try:
+                sleep(NEW_SESSION_DELAY)
+            except KeyboardInterrupt:
+                stopped_by_user = True
+                break
+            if rescheduled:
+                break
+    except KeyboardInterrupt:
+        stopped_by_user = True
+    if stopped_by_user:
+        log_message("Stopped by user (Ctrl-C) - exiting cleanly without sending exit email.")
+        raise SystemExit(0)
     gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
     msg = Message(
         f"Rescheduler Program Exited",

@@ -97,8 +97,19 @@ SHOW_GUI = True  # toggle to false if you don't want to see the browser
 # For testing, also set a date really far away so the app actually tries to reschedule
 TEST_MODE = os.getenv("TEST_MODE", "True").strip().lower() in ("1", "true", "yes", "on")
 
+# When True (default), only book a slot strictly earlier than your currently
+# booked appointment. Set to False to allow booking any in-window date --
+# e.g. moving to a later date at a different consulate.
+# Set in .env (project root) as: ONLY_EARLIER_THAN_CURRENT_APPOINTMENT="True"/"False"
+ONLY_EARLIER_THAN_CURRENT_APPOINTMENT = os.getenv(
+    "ONLY_EARLIER_THAN_CURRENT_APPOINTMENT",
+    os.getenv("REQUIRE_EARLIER_DATE", "True"),
+).strip().lower() in ("1", "true", "yes", "on")
+# Legacy alias (old .env name) -- do not use in new code.
+REQUIRE_EARLIER_DATE = ONLY_EARLIER_THAN_CURRENT_APPOINTMENT
+
 # Don't change the following unless you know what you are doing
-DETACH = True
+DETACH = False
 NEW_SESSION_AFTER_FAILURES = 5
 NEW_SESSION_DELAY = 300
 TIMEOUT = 10
