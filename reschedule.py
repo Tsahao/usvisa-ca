@@ -1,5 +1,6 @@
 import random
 import re
+import time
 import traceback
 from datetime import datetime
 from time import sleep
@@ -9,7 +10,7 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -231,15 +232,25 @@ def get_available_dates(
 ) -> Union[List[datetime.date], None]:
     request_tracker.log_retry()
     request_tracker.retry()
-    schedule_base = driver.current_url.split("/appointment")[0]
+    try:
+        current_url = driver.current_url
+        request_header_cookie = "".join(
+            [f"{cookie['name']}={cookie['value']};" for cookie in driver.get_cookies()]
+        )
+        user_agent = driver.execute_script("return navigator.userAgent")
+        referer = driver.current_url
+    except WebDriverException as e:
+        # Browser crashed / window closed manually / DevTools disconnected.
+        # Polling the same dead driver is pointless -- let the caller
+        # start a fresh session.
+        log_message(f"Browser session died during date request: {e}")
+        raise
+    schedule_base = current_url.split("/appointment")[0]
     request_url = schedule_base + "/appointment" + AVAILABLE_DATE_REQUEST_SUFFIX
-    request_header_cookie = "".join(
-        [f"{cookie['name']}={cookie['value']};" for cookie in driver.get_cookies()]
-    )
     request_headers = REQUEST_HEADERS.copy()
     request_headers["Cookie"] = request_header_cookie
-    request_headers["User-Agent"] = driver.execute_script("return navigator.userAgent")
-    request_headers["Referer"] = driver.current_url
+    request_headers["User-Agent"] = user_agent
+    request_headers["Referer"] = referer
     try:
         response = requests.get(request_url, headers=request_headers)
     except Exception as e:
@@ -269,7 +280,12 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
     )
     empty_streak = 0
     while date_request_tracker.should_retry():
-        dates = get_available_dates(driver, date_request_tracker)
+        iteration_start = time.time()
+        try:
+            dates = get_available_dates(driver, date_request_tracker)
+        except WebDriverException as e:
+            log_message(f"Browser session died - starting a new session: {e}")
+            return False
         if dates is None:
             log_message("Error occured when requesting available dates")
             sleep(jittered_delay(DATE_REQUEST_DELAY))
@@ -304,6 +320,10 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
         if target_date is None:
             log_message(f"No acceptable date found. Earliest available date is {dates[0]}")
             sleep(jittered_delay(DATE_REQUEST_DELAY))
+            # Healthy response, just nothing in range -- poll forever on
+            # the same login. Exempt from retry/time budget so other
+            # errors (network/empty/booking) are what trigger a restart.
+            date_request_tracker.forgive_last_retry(time.time() - iteration_start)
             continue
         log_message(f"FOUND SLOT ON {target_date}!!!")
         try:
@@ -333,6 +353,9 @@ def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
             gmail.close()
             return True
         except Exception as e:
+            if isinstance(e, WebDriverException):
+                log_message(f"Browser session died during booking - starting a new session: {e}")
+                return False
             log_message(f"Rescheduling failed: {e}")
             traceback.print_exc()
             continue
@@ -354,7 +377,17 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
                 setup_ok = True
                 break
             except Exception as e:
-                log_message(f"Unable to get appointment page at {driver.current_url}: {e}")
+                try:
+                    current_page = driver.current_url
+                except Exception:
+                    current_page = "<browser session dead>"
+                log_message(f"Unable to get appointment page at {current_page}: {e}")
+                if isinstance(e, WebDriverException):
+                    # Dead driver will never recover with retries on the
+                    # same instance -- bail out for a fresh driver.
+                    session_failures = NEW_SESSION_AFTER_FAILURES
+                    _consecutive_setup_failures += 1
+                    break
                 session_failures += 1
                 _consecutive_setup_failures += 1
                 if _consecutive_setup_failures >= SETUP_FAILURE_SOFT_BAN_THRESHOLD:
@@ -398,7 +431,15 @@ if __name__ == "__main__":
     while True:
         session_count += 1
         log_message(f"Attempting with new session #{session_count}")
-        rescheduled = reschedule_with_new_session()
+        try:
+            rescheduled = reschedule_with_new_session()
+        except WebDriverException as e:
+            log_message(f"Browser died outside poll loop ({e}) - starting a new session")
+            rescheduled = False
+        except Exception as e:
+            log_message(f"Unexpected error in session #{session_count}: {e}")
+            traceback.print_exc()
+            rescheduled = False
         sleep(NEW_SESSION_DELAY)
         if rescheduled:
             break

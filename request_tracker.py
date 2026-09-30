@@ -25,3 +25,14 @@ class RequestTracker:
     def log_retry(self):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{timestamp}] Session retry: {self.retries}")
+
+    def forgive_last_retry(self, poll_duration: float) -> None:
+        """Exempt the last poll from the retry budget.
+
+        Used for healthy-but-unusable responses (e.g. dates exist but
+        none fall in the acceptable range). Those should poll forever
+        on the same login, while real failures (network/empty/booking)
+        still count toward max_retries/max_time.
+        """
+        self.retries = max(0, self.retries - 1)
+        self.start_time += max(0.0, poll_duration)

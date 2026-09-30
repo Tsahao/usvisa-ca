@@ -23,6 +23,7 @@ A simple Python script for making US visa interview appointments in Canada
 ## Prerequisites
 
 - Python 3.x installed
+- Google Chrome installed (the script drives Chrome via Selenium; it will fail without a Chrome binary — Safari/Firefox/Edge are not supported)
 - An existing US visa appointment booked on https://ais.usvisa-info.com/en-ca/
 - Gmail account for notifications (optional but recommended)
 
