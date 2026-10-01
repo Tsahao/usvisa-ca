@@ -12,11 +12,21 @@ from settings import (
     NUM_PARTICIPANTS,
     USER_CONSULATE,
     USER_CONSULATE_ID,
+    VERIFY_UNVERIFIED_BOOKING,
 )
 
 
 class UnverifiedReschedule(Exception):
-    pass
+    """Confirm clicked but success unproven. Carries the attempted date.
+
+    target_date is the calendar-selected date (date-only) that was
+    attempted, so the caller can verify it against the dashboard without
+    re-reading any page state. None when unknown (back-compat).
+    """
+
+    def __init__(self, message, target_date=None):
+        super().__init__(message)
+        self.target_date = target_date
 
 
 def _select_configured_consulate(driver, timeout=10) -> bool:
@@ -728,7 +738,19 @@ def legacy_reschedule(
     sleep(2)
     driver.implicitly_wait(0.1)
     if TEST_MODE:
+        # SAFETY: never click confirm in TEST_MODE. When verification is
+        # enabled, raise UnverifiedReschedule (instead of returning False)
+        # so the caller's fresh-driver dashboard check + continue path is
+        # exercised end-to-end. The check itself is read-only (dashboard
+        # GETs) and, since nothing was booked, verifies as "still old" =>
+        # silent continue. No appointment can be made on this path.
         print(f"{datetime.now().strftime('%H:%M:%S')} TEST_MODE enabled - skipping final confirmation click\n")
+        if VERIFY_UNVERIFIED_BOOKING:
+            raise UnverifiedReschedule(
+                "TEST_MODE: confirmation click skipped; simulated unverified "
+                f"attempt for {date_selected} to exercise verification.",
+                target_date=date_selected,
+            )
         return False
     confirm.click()
     sleep(5)
@@ -755,5 +777,6 @@ def legacy_reschedule(
         raise UnverifiedReschedule(
             "Confirm was clicked but reschedule success could not be verified. "
             "Stopping to avoid wasting limited reschedule attempts. "
-            "PLEASE CHECK YOUR APPOINTMENT MANUALLY at ais.usvisa-info.com"
+            "PLEASE CHECK YOUR APPOINTMENT MANUALLY at ais.usvisa-info.com",
+            target_date=date_selected,
         )

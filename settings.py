@@ -108,10 +108,27 @@ ONLY_EARLIER_THAN_CURRENT_APPOINTMENT = os.getenv(
 # Legacy alias (old .env name) -- do not use in new code.
 REQUIRE_EARLIER_DATE = ONLY_EARLIER_THAN_CURRENT_APPOINTMENT
 
+# When True (default), an UnverifiedReschedule (confirm clicked but no
+# success signal) is re-checked with a fresh login reading the dashboard's
+# booked date: == target => success/quit, == previous => silent continue
+# with a new polling session, anything else => manual-check email + quit.
+# Set in .env as: VERIFY_UNVERIFIED_BOOKING="True"/"False"
+VERIFY_UNVERIFIED_BOOKING = os.getenv(
+    "VERIFY_UNVERIFIED_BOOKING", "True"
+).strip().lower() in ("1", "true", "yes", "on")
+try:
+    VERIFY_MAX_READS = int(os.getenv("VERIFY_MAX_READS", "3"))
+except (TypeError, ValueError):
+    VERIFY_MAX_READS = 3
+try:
+    VERIFY_READ_DELAY = int(os.getenv("VERIFY_READ_DELAY", "10"))
+except (TypeError, ValueError):
+    VERIFY_READ_DELAY = 10
+
 # Don't change the following unless you know what you are doing
 DETACH = False
 NEW_SESSION_AFTER_FAILURES = 5
-NEW_SESSION_DELAY = 300
+NEW_SESSION_DELAY = 60
 TIMEOUT = 10
 try:
     FAIL_RETRY_DELAY = int(os.getenv("FAIL_RETRY_DELAY", "180"))
@@ -127,6 +144,14 @@ except (TypeError, ValueError):
     DATE_REQUEST_JITTER = 30
 DATE_REQUEST_MAX_RETRY = 5
 DATE_REQUEST_MAX_TIME = 15 * 60
+# Max wall-clock age of a healthy polling session, even if every poll is
+# forgiven (healthy-but-unusable). Forgiven polls refund RequestTracker time,
+# so without this a session could live for hours on one login. Observed
+# logouts ~60min, so 90min forces a proactive fresh login as a backstop.
+try:
+    MAX_HEALTHY_SESSION_AGE = int(os.getenv("MAX_HEALTHY_SESSION_AGE", str(90 * 60)))
+except (TypeError, ValueError):
+    MAX_HEALTHY_SESSION_AGE = 90 * 60
 try:
     SOFT_BAN_COOLDOWN = int(os.getenv("SOFT_BAN_COOLDOWN", "3600"))
 except (TypeError, ValueError):

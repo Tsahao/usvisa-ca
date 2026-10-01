@@ -33,11 +33,107 @@ def log_message(message: str) -> None:
     print(f"[{timestamp}] {message}")
 
 
+def _send_gmail_notification(subject: str, body: str) -> None:
+    """Send a Gmail notification, or log-only in TEST_MODE.
+
+    TEST_MODE must never spam real recipients while exercising the
+    verification flow, so all notification sends funnel through here.
+    Live behavior is unchanged; send failures are logged, never fatal.
+    """
+    if TEST_MODE:
+        log_message(f"[TEST_MODE] Would send email '{subject}': {body}")
+        return
+    try:
+        gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
+        msg = Message(
+            subject,
+            to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
+            text=body,
+        )
+        gmail.send(msg)
+        gmail.close()
+    except Exception as e:
+        log_message(f"Email notification failed (continuing): {e}")
+
+
+def verify_booking_after_unverified(previous_date, target_date) -> str:
+    """Re-check the dashboard with a fresh login. Read-only, never books.
+
+    Returns "success" (dashboard == target), "failure" (repeated reads ==
+    previous), or "unknown" (anything ambiguous: None, third date, login
+    failure, missing target). Callers must treat "unknown" as manual-check
+    + quit, never as failure. Date-only comparison per configuration.
+    """
+    if target_date is None:
+        log_message("Verification skipped: no target date carried by UnverifiedReschedule")
+        return "unknown"
+    max_reads = VERIFY_MAX_READS if VERIFY_MAX_READS > 0 else 3
+    read_delay = VERIFY_READ_DELAY if VERIFY_READ_DELAY >= 0 else 10
+    driver, user_data_dir = get_chrome_driver()
+    try:
+        try:
+            login(driver)
+        except Exception as e:
+            log_message(f"Verification login failed: {e}")
+            return "unknown"
+        readings = []
+        for attempt in range(max_reads):
+            verified = None
+            try:
+                try:
+                    WebDriverWait(driver, TIMEOUT).until(
+                        lambda d: d.find_elements(By.CSS_SELECTOR, "p.consular-appt")
+                        or _find_visible_action(d, "Schedule Appointment")
+                        or _find_visible_action(d, "Continue")
+                    )
+                except TimeoutException:
+                    pass
+                verified = get_current_appointment_date(driver)
+            except Exception as e:
+                log_message(f"Verification read {attempt + 1}/{max_reads} errored: {e}")
+                verified = None
+            readings.append(verified)
+            log_message(
+                f"Verification read {attempt + 1}/{max_reads}: dashboard shows "
+                f"{verified}, expected {target_date}, previous {previous_date}"
+            )
+            if verified is not None and verified == target_date:
+                return "success"
+            if attempt < max_reads - 1:
+                sleep(read_delay)
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+        # No read matched the target. Only a confident "still old" counts
+        # as failure; everything else is unknown (fail-safe: quit).
+        if previous_date is not None and all(
+            r is not None and r == previous_date for r in readings
+        ):
+            return "failure"
+        return "unknown"
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+
+
 def jittered_delay(base_delay: float) -> float:
     return base_delay + random.uniform(0, DATE_REQUEST_JITTER)
 
 
 class SoftBanDetected(Exception):
+    pass
+
+
+class SessionExpired(Exception):
+    """Login cookies dead (redirect to sign_in / 401/403 / HTML login page).
+
+    Non-retryable on the same driver -- caller must quit and start a fresh
+    session immediately instead of burning retry budget.
+    """
     pass
 
 
@@ -306,6 +402,10 @@ def get_available_dates(
         # start a fresh session.
         log_message(f"Browser session died during date request: {e}")
         raise
+    if "/users/sign_in" in current_url:
+        # Browser already bounced back to the login page -- cookies dead.
+        log_message("Browser on sign_in page during date request - session expired, starting a new session")
+        raise SessionExpired("browser redirected to sign_in")
     schedule_base = current_url.split("/appointment")[0]
     request_url = schedule_base + "/appointment" + AVAILABLE_DATE_REQUEST_SUFFIX
     request_headers = REQUEST_HEADERS.copy()
@@ -317,6 +417,9 @@ def get_available_dates(
     except Exception as e:
         log_message(f"Get available dates request failed: {e}")
         return None
+    if response.status_code in (401, 403):
+        log_message(f"Session expired (HTTP {response.status_code}) - starting a new session")
+        raise SessionExpired(f"HTTP {response.status_code}")
     if response.status_code != 200:
         log_message(f"Failed with status code {response.status_code}")
         log_message(f"Response Text: {response.text[:300]}")
@@ -325,7 +428,8 @@ def get_available_dates(
         dates_json = response.json()
     except:
         if "sign_in" in response.text or response.text.lstrip().startswith("<"):
-            log_message("Received HTML instead of JSON - session likely expired or request was blocked, starting a new session")
+            log_message("Received HTML instead of JSON - session expired, starting a new session immediately")
+            raise SessionExpired("HTML sign_in instead of JSON")
         else:
             log_message("Failed to decode json")
             log_message(f"Response Text: {response.text[:300]}")
@@ -339,11 +443,21 @@ def reschedule(driver: WebDriver, retryCount: int = 0, current_date=None) -> boo
         retryCount if (retryCount > 0) else DATE_REQUEST_MAX_RETRY,
         DATE_REQUEST_DELAY * retryCount if (retryCount > 0) else DATE_REQUEST_MAX_TIME
     )
+    # Wall-clock backstop for healthy sessions: forgiven polls refund
+    # RequestTracker time, so without this a session could live for hours on
+    # one login (observed logouts ~60min).
+    session_wall_start = time.time()
     empty_streak = 0
     while date_request_tracker.should_retry():
+        if time.time() - session_wall_start > MAX_HEALTHY_SESSION_AGE:
+            log_message(f"Max healthy session age ({MAX_HEALTHY_SESSION_AGE // 60}min) reached - starting a new session")
+            return False
         iteration_start = time.time()
         try:
             dates = get_available_dates(driver, date_request_tracker)
+        except SessionExpired as e:
+            log_message(f"Session expired - starting a new session immediately: {e}")
+            return False
         except WebDriverException as e:
             log_message(f"Browser session died - starting a new session: {e}")
             return False
@@ -420,30 +534,35 @@ def reschedule(driver: WebDriver, retryCount: int = 0, current_date=None) -> boo
                 current_date,
                 ONLY_EARLIER_THAN_CURRENT_APPOINTMENT,
             ):
-                gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
-                msg = Message(
+                _send_gmail_notification(
                     f"Visa Appointment Rescheduled for {target_date}",
-                    to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
-                    text=f"Your visa appointment has been successfully rescheduled to {target_date} at {USER_CONSULATE} consulate."
+                    f"Your visa appointment has been successfully rescheduled to {target_date} at {USER_CONSULATE} consulate.",
                 )
-                gmail.send(msg)
-                gmail.close()
                 log_message("SUCCESSFULLY RESCHEDULED!!!")
                 return True
             return False
         except UnverifiedReschedule as e:
-            log_message(f"STOPPING: {e}")
-            gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
-            msg = Message(
-                f"Visa Rescheduler: MANUAL VERIFICATION NEEDED",
-                to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
-                text=f"The rescheduler clicked confirm for {target_date} at {USER_CONSULATE} but could not verify success. "
-                     f"Please log in to ais.usvisa-info.com and check your appointment. "
-                     f"The program has stopped to avoid wasting reschedule attempts."
-            )
-            gmail.send(msg)
-            gmail.close()
-            return True
+            if not VERIFY_UNVERIFIED_BOOKING:
+                log_message(f"STOPPING: {e}")
+                _send_gmail_notification(
+                    "Visa Rescheduler: MANUAL VERIFICATION NEEDED",
+                    f"The rescheduler clicked confirm for {target_date} at {USER_CONSULATE} but could not verify success. "
+                    f"Please log in to ais.usvisa-info.com and check your appointment. "
+                    f"The program has stopped to avoid wasting reschedule attempts.",
+                )
+                return True
+            # Verification enabled: propagate to reschedule_with_new_session,
+            # which quits this (possibly stale) driver first, then re-checks
+            # with a fresh login. Attach the attempted date if missing.
+            if getattr(e, "target_date", None) is None:
+                try:
+                    e.target_date = target_date
+                except Exception:
+                    pass
+            raise
+        except SessionExpired as e:
+            log_message(f"Session expired during booking - starting a new session immediately: {e}")
+            return False
         except Exception as e:
             if isinstance(e, WebDriverException):
                 log_message(f"Browser session died during booking - starting a new session: {e}")
@@ -454,9 +573,18 @@ def reschedule(driver: WebDriver, retryCount: int = 0, current_date=None) -> boo
     return False
 
 
-def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> bool:
+def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> tuple:
+    """Run one polling session. Returns (done, skip_delay).
+
+    done=True means quit the program (booked or manual-check needed).
+    skip_delay=True means the caller should start the next session
+    immediately without sleeping NEW_SESSION_DELAY (used only after a
+    verified-failed unverified attempt, whose ~40s verification already
+    acted as cool-down).
+    """
     global _consecutive_setup_failures
     driver, user_data_dir = get_chrome_driver()
+    old_quit = False
     try:
         session_failures = 0
         timeout = TIMEOUT
@@ -498,9 +626,9 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
                 except Exception:
                     current_page = "<browser session dead>"
                 log_message(f"Unable to get appointment page at {current_page}: {e}")
-                if isinstance(e, WebDriverException):
-                    # Dead driver will never recover with retries on the
-                    # same instance -- bail out for a fresh driver.
+                if isinstance(e, (WebDriverException, SessionExpired)):
+                    # Dead driver / dead login will never recover with retries
+                    # on the same instance -- bail out for a fresh driver.
                     session_failures = NEW_SESSION_AFTER_FAILURES
                     _consecutive_setup_failures += 1
                     break
@@ -513,22 +641,66 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> boo
                 continue
         if setup_ok:
             _consecutive_setup_failures = 0
-        rescheduled = reschedule(driver, retryCount, current_date)
+        try:
+            rescheduled = reschedule(driver, retryCount, current_date)
+        except UnverifiedReschedule as e:
+            # Quit the possibly-stale polling driver BEFORE verification so
+            # only one Chrome is alive at a time.
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+            old_quit = True
+            target = getattr(e, "target_date", None)
+            log_message(f"Unverified attempt for {target} - re-checking with a fresh login...")
+            try:
+                outcome = verify_booking_after_unverified(current_date, target)
+            except Exception as ve:
+                log_message(f"Verification crashed: {ve}")
+                outcome = "unknown"
+            if outcome == "success":
+                _send_gmail_notification(
+                    f"Visa Appointment Rescheduled for {target}",
+                    f"Your visa appointment has been successfully rescheduled to {target} at {USER_CONSULATE} consulate. "
+                    f"(Verified with a fresh login after an unverified confirm.)",
+                )
+                log_message("SUCCESSFULLY RESCHEDULED (verified after unverified)!!!")
+                return True, False
+            elif outcome == "failure":
+                log_message(
+                    f"Verification: still booked {current_date}, {target} was not booked - "
+                    f"continuing with a new session immediately (no {NEW_SESSION_DELAY}s delay)"
+                )
+                return False, True
+            else:
+                log_message(f"STOPPING: {e}")
+                _send_gmail_notification(
+                    "Visa Rescheduler: MANUAL VERIFICATION NEEDED",
+                    f"The rescheduler clicked confirm for {target} at {USER_CONSULATE} but could not verify success. "
+                    f"Please log in to ais.usvisa-info.com and check your appointment. "
+                    f"The program has stopped to avoid wasting reschedule attempts.",
+                )
+                return True, False
         if rescheduled:
-            return True
+            return True, False
         else:
-            return False
+            return False, False
+    except SessionExpired as e:
+        log_message(f"Session expired in this session ({e}) - starting a new session immediately")
+        return False, False
     except SoftBanDetected:
         log_message(f"Soft-ban detected - cooling down for {SOFT_BAN_COOLDOWN // 60} minutes before retrying")
         _consecutive_setup_failures = 0
         sleep(SOFT_BAN_COOLDOWN)
-        return False
+        return False, False
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+        if not old_quit:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -555,23 +727,27 @@ if __name__ == "__main__":
         while True:
             session_count += 1
             log_message(f"Attempting with new session #{session_count}")
+            skip_delay = False
             try:
-                rescheduled = reschedule_with_new_session()
+                rescheduled, skip_delay = reschedule_with_new_session()
             except KeyboardInterrupt:
                 stopped_by_user = True
                 break
-            except WebDriverException as e:
-                log_message(f"Browser died outside poll loop ({e}) - starting a new session")
+            except (WebDriverException, SessionExpired) as e:
+                log_message(f"Browser/session died outside poll loop ({e}) - starting a new session")
                 rescheduled = False
             except Exception as e:
                 log_message(f"Unexpected error in session #{session_count}: {e}")
                 traceback.print_exc()
                 rescheduled = False
-            try:
-                sleep(NEW_SESSION_DELAY)
-            except KeyboardInterrupt:
-                stopped_by_user = True
-                break
+            if skip_delay and not rescheduled:
+                log_message("Skipping session delay after verified-failed attempt - starting next session immediately")
+            else:
+                try:
+                    sleep(NEW_SESSION_DELAY)
+                except KeyboardInterrupt:
+                    stopped_by_user = True
+                    break
             if rescheduled:
                 break
     except KeyboardInterrupt:
@@ -579,11 +755,7 @@ if __name__ == "__main__":
     if stopped_by_user:
         log_message("Stopped by user (Ctrl-C) - exiting cleanly without sending exit email.")
         raise SystemExit(0)
-    gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
-    msg = Message(
-        f"Rescheduler Program Exited",
-        to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
-        text=f"The rescheduler program has exited on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
+    _send_gmail_notification(
+        "Rescheduler Program Exited",
+        f"The rescheduler program has exited on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.",
     )
-    gmail.send(msg)
-    gmail.close()
