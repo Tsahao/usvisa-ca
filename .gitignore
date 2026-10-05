@@ -170,4 +170,7 @@ logs/
 .DS_Store
 
 # local-only dev tests (end users running the rescheduler don't need these)
-tests/
+tests/*
+# Private payment-tracker delivery state and atomic-write temporary files
+.payment_tracker_state.json
+.payment_tracker_state.json.*.tmp

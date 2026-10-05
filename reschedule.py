@@ -81,11 +81,7 @@ def verify_booking_after_unverified(previous_date, target_date) -> str:
             verified = None
             try:
                 try:
-                    WebDriverWait(driver, TIMEOUT).until(
-                        lambda d: d.find_elements(By.CSS_SELECTOR, "p.consular-appt")
-                        or _find_visible_action(d, "Schedule Appointment")
-                        or _find_visible_action(d, "Continue")
-                    )
+                    WebDriverWait(driver, TIMEOUT).until(_dashboard_ready)
                 except TimeoutException:
                     pass
                 verified = get_current_appointment_date(driver)
@@ -155,7 +151,11 @@ def get_chrome_driver() -> tuple:
     options.add_argument('--disable-dev-shm-usage')
     user_data_dir = f'/tmp/chrome-{datetime.now().strftime("%Y%m%d-%H%M%S")}-{random.randint(1000, 9999)}'
     options.add_argument(f'--user-data-dir={user_data_dir}')
-    driver = webdriver.Chrome(options=options)
+    try:
+        driver = webdriver.Chrome(options=options)
+    except BaseException:
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+        raise
     return driver, user_data_dir
 
 
@@ -227,10 +227,13 @@ def get_current_appointment_date(driver: WebDriver):
     Looks for <p class="consular-appt">Consular Appointment: 14 January,
     2027, ...</p>. Returns None when the block is absent (paid but never
     booked) or unparseable. Must be called while on the post-login
-    dashboard, before navigating to the appointment page.
+    dashboard, before navigating to the appointment page. When an IVR is
+    configured, only read its group; a missing/ambiguous group must not
+    be mistaken for a first booking or another group's appointment.
     """
+    scope = _get_dashboard_scope(driver)
     try:
-        elements = driver.find_elements(By.CSS_SELECTOR, "p.consular-appt")
+        elements = scope.find_elements(By.CSS_SELECTOR, "p.consular-appt")
     except Exception:
         return None
     for element in elements:
@@ -246,8 +249,8 @@ def get_current_appointment_date(driver: WebDriver):
 def _find_visible_action(driver: WebDriver, label: str):
     locators = (
         (By.LINK_TEXT, label),
-        (By.XPATH, f"//button[normalize-space()='{label}']"),
-        (By.XPATH, f"//input[@value='{label}']"),
+        (By.XPATH, f".//button[normalize-space()='{label}']"),
+        (By.XPATH, f".//input[@value='{label}']"),
     )
     for locator in locators:
         try:
@@ -263,6 +266,97 @@ def _find_visible_action(driver: WebDriver, label: str):
                 # not visible rather than crashing setup.
                 continue
     return False
+
+
+_IVR_ACCOUNT_PATTERN = re.compile(
+    r"\bIVR\s+Account\s+Number\s*:\s*([0-9]+)\b", re.IGNORECASE
+)
+_IVR_LABEL_XPATH = (
+    "//*[contains(normalize-space(.), 'IVR Account Number')"
+    " and not(.//*[contains(normalize-space(.), 'IVR Account Number')])]"
+)
+_GROUP_ANCESTOR_XPATH = (
+    "ancestor::*[.//a[normalize-space()='Continue']"
+    " or .//button[normalize-space()='Continue']"
+    " or .//input[@value='Continue']][1]"
+)
+
+
+def _find_dashboard_group(
+    driver: WebDriver, ivr_account_number=None, *, single_group_fallback=False
+):
+    """Find one IVR-labelled card, never a container spanning other groups.
+
+    Start at the smallest IVR label node and find its nearest ancestor
+    containing Continue. This avoids depending on the site's card classes.
+    Only an explicitly blank selector with single_group_fallback enabled
+    may select the sole visible group; paid callers keep their old behavior.
+    """
+    selected_ivr = (
+        PAID_IVR_ACCOUNT_NUMBER if ivr_account_number is None else ivr_account_number
+    )
+    auto_select = single_group_fallback and ivr_account_number == ""
+    groups = []
+    for label in driver.find_elements(By.XPATH, _IVR_LABEL_XPATH):
+        try:
+            if not label.is_displayed():
+                continue
+            ancestors = label.find_elements(By.XPATH, _GROUP_ANCESTOR_XPATH)
+            if not ancestors:
+                if auto_select:
+                    raise RuntimeError("Cannot identify every visible dashboard group")
+                continue
+            group = ancestors[0]
+            group_ivrs = _IVR_ACCOUNT_PATTERN.findall(group.text)
+            if auto_select:
+                if len(group_ivrs) != 1:
+                    raise RuntimeError("Dashboard group has an ambiguous IVR identity")
+            elif group_ivrs != [selected_ivr]:
+                continue
+            if group not in groups:
+                groups.append(group)
+        except WebDriverException:
+            # Re-rendered dashboard: wait for a fresh lookup, not another group.
+            if auto_select:
+                return False
+            continue
+    if len(groups) > 1:
+        if auto_select:
+            raise RuntimeError(
+                "Multiple dashboard groups; set UNPAID_IVR_ACCOUNT_NUMBER"
+            )
+        raise RuntimeError(
+            "Multiple dashboard groups match the configured IVR; "
+            "refusing to select a group"
+        )
+    return groups[0] if groups else False
+
+
+def _get_dashboard_scope(driver: WebDriver, ivr_account_number=None):
+    selected_ivr = (
+        PAID_IVR_ACCOUNT_NUMBER if ivr_account_number is None else ivr_account_number
+    )
+    if not selected_ivr:
+        return driver
+    try:
+        return WebDriverWait(driver, TIMEOUT).until(
+            lambda current_driver: _find_dashboard_group(current_driver, selected_ivr)
+        )
+    except TimeoutException as exc:
+        raise TimeoutException(
+            "Could not find a unique dashboard group for the configured IVR; "
+            "refusing to use another group's Continue or appointment"
+        ) from exc
+
+
+def _dashboard_ready(driver: WebDriver):
+    if PAID_IVR_ACCOUNT_NUMBER:
+        return _find_dashboard_group(driver)
+    return (
+        driver.find_elements(By.CSS_SELECTOR, "p.consular-appt")
+        or _find_visible_action(driver, "Schedule Appointment")
+        or _find_visible_action(driver, "Continue")
+    )
 
 
 def _click_action_if_present(
@@ -368,7 +462,14 @@ def get_appointment_page(driver: WebDriver) -> None:
 
     # Newer flows show a group-action page with this link. Older flows first
     # show a Continue link and then expose Schedule Appointment.
-    if not _click_action_if_present(driver, "Schedule Appointment", 2):
+    if PAID_IVR_ACCOUNT_NUMBER:
+        group = _get_dashboard_scope(driver)
+        if not _click_action_if_present(group, "Continue", timeout):
+            raise TimeoutException(
+                "Could not find Continue in the PAID_IVR_ACCOUNT_NUMBER group"
+            )
+        _click_action_if_present(driver, "Schedule Appointment", timeout)
+    elif not _click_action_if_present(driver, "Schedule Appointment", 2):
         if not _click_action_if_present(driver, "Continue", timeout):
             raise TimeoutException(
                 "Could not find either 'Schedule Appointment' or 'Continue'"
@@ -597,11 +698,7 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> tup
                 # navigating to the appointment page (the p.consular-appt
                 # node is only on the dashboard). Absent => first-book flow.
                 try:
-                    WebDriverWait(driver, timeout).until(
-                        lambda d: d.find_elements(By.CSS_SELECTOR, "p.consular-appt")
-                        or _find_visible_action(d, "Schedule Appointment")
-                        or _find_visible_action(d, "Continue")
-                    )
+                    WebDriverWait(driver, timeout).until(_dashboard_ready)
                 except TimeoutException:
                     pass
                 current_date = get_current_appointment_date(driver)
@@ -641,6 +738,9 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> tup
                 continue
         if setup_ok:
             _consecutive_setup_failures = 0
+        else:
+            # Never poll or book after setup failed (including an IVR mismatch).
+            return False, False
         try:
             rescheduled = reschedule(driver, retryCount, current_date)
         except UnverifiedReschedule as e:

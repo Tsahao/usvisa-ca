@@ -1,12 +1,27 @@
 from dotenv import load_dotenv
 import os
 from datetime import datetime
+from pathlib import Path
 # Load environment variables
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"))
 
 # Account Info
 USER_EMAIL = os.getenv("USER_EMAIL")
 USER_PASSWORD = os.getenv("USER_PASSWORD")
+# Optional paid booking selector; preserve leading zeros.
+PAID_IVR_ACCOUNT_NUMBER = os.getenv("PAID_IVR_ACCOUNT_NUMBER", "").strip()
+if PAID_IVR_ACCOUNT_NUMBER and (
+    not PAID_IVR_ACCOUNT_NUMBER.isascii() or not PAID_IVR_ACCOUNT_NUMBER.isdecimal()
+):
+    raise ValueError("PAID_IVR_ACCOUNT_NUMBER must contain only digits, or be left blank")
+# Validate tracker-only settings at tracker startup, not when booking imports us.
+UNPAID_IVR_ACCOUNT_NUMBER = os.getenv("UNPAID_IVR_ACCOUNT_NUMBER", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Tracker-only policy; validate at tracker startup so paid booking is unaffected.
+FIRST_APPOINTMENT_ALERT_IN_RANGE_ONLY = os.getenv(
+    "FIRST_APPOINTMENT_ALERT_IN_RANGE_ONLY", "NO"
+).strip()
 try:
     NUM_PARTICIPANTS = int(os.getenv("NUM_PARTICIPANTS", "1"))
 except (TypeError, ValueError):
