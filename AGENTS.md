@@ -7,7 +7,7 @@
 - IVRs: `PAID_IVR_ACCOUNT_NUMBER` selects the paid booking group; blank retains first-Continue behavior. Blank/missing `UNPAID_IVR_ACCOUNT_NUMBER` auto-selects only one unambiguous visible dashboard group; multiple groups require the exact unpaid IVR. Never use the paid selector as fallback or select a group explicitly marked paid. Missing tracker/Telegram settings must not block paid booking.
 - Dry run: `TEST_MODE="True"` (default) **never clicks confirm** — `legacy_rescheduler.py` raises `UnverifiedReschedule` instead to exercise verification read-only. `False` = live booking.
 - No `pytest` installed; use `python3 -m unittest discover -s tests -v`.
-- Tests are env-leaky: browser tests read `USER_CONSULATE` from `.env`. Run with `USER_CONSULATE=Calgary` (fakes only offer Toronto 94 / Calgary 89); `ConsulateSettingsTests` pass regardless.
+- Tests isolate application imports with `USER_CONSULATE=Calgary`, a cleared environment, and mocked `dotenv.load_dotenv`; never load private `.env` credentials. Browser fakes only offer Toronto 94 / Calgary 89.
 
 ## Architecture
 - `reschedule.py`: session lifecycle, polling, verification. `legacy_rescheduler.py`: Selenium calendar/booking only (no `requests`). `settings.py`: `.env` via `python-dotenv`. `request_tracker.py`: retry/time budgets.
@@ -32,4 +32,4 @@
 - Never add a same-driver dashboard check that navigates the polling driver away; verification owns its driver and quits it.
 - `_find_dashboard_group`/`_get_dashboard_scope` accept an explicit IVR; omitted arguments retain the paid selector and current test monkeypatch behavior. Only an explicitly blank IVR plus `_find_dashboard_group(..., single_group_fallback=True)` permits sole-group selection; discovery must fail closed on malformed/stale cards. Never mutate the paid global to select an unpaid group.
 - Tracker unavailable rows are healthy; missing/duplicate/malformed summary data are errors, not empty-calendar soft bans. Recheck dates before delayed sends; never log full HTML, applicant details, tokens, cookies, or credential-bearing exception URLs.
-- Current payment DOM selectors need opt-in live validation. Automated tests are offline and local-only; all files under `tests/` are ignored. `legacy/detect_and_notify.py` is superseded.
+- Current payment DOM selectors need opt-in live validation. Automated tests are offline, use synthetic credentials/account fixtures, and are tracked under `tests/`; only generated test artifacts are ignored. Never add real credentials, account/applicant details, or private page dumps to tests. `legacy/detect_and_notify.py` is superseded.
